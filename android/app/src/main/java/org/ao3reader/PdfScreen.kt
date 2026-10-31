@@ -36,9 +36,10 @@ interface BookView {
 }
 
 /** A PDF: its pages as they are, one under another at the screen's width. The Rust engine draws
- *  them on background threads; tap the middle for the toolbar. */
-class PdfScreen(private val a: MainActivity, val workId: String, opened: JSONObject) : FrameLayout(a), BookView {
-    private val meta: JSONObject = opened.getJSONObject("meta")
+ *  them on background threads; tap a page for the toolbar, or a note to read it. A locked PDF asks
+ *  for its password first. */
+class PdfScreen(private val a: MainActivity, val workId: String, private val opened: JSONObject) : FrameLayout(a), BookView {
+    private var title = opened.getJSONObject("meta").optString("title")
     private val pages = PdfPages(a, this)
     private var top = LinearLayout(a)
     private var pageLabel = TextView(a)
@@ -50,12 +51,60 @@ class PdfScreen(private val a: MainActivity, val workId: String, opened: JSONObj
     private var dirty = false
 
     init {
-        val pdf = Core.obj("pdf.open", json("id" to workId))
+        val locked = !open(null)
+        chrome = locked
+        rebuild()
+        if (locked) post { askPassword() }
+    }
+
+    /** Opens the PDF, unlocked with `password` if given. False while it's locked. */
+    private fun open(password: String?): Boolean {
+        val pdf = Core.obj("pdf.open", if (password == null) json("id" to workId) else json("id" to workId, "password" to password))
+        if (pdf.optBoolean("locked")) return false
+        title = pdf.optString("title", title)
         val sizes = pdf.getJSONArray("sizes")
         pages.sizes = (0 until sizes.length()).map { val s = sizes.getJSONArray(it); s.getDouble(0).toFloat() to s.getDouble(1).toFloat() }
         pages.start(pdf.getInt("doc"))
         pages.goTo(opened.optDouble("position", 0.0).toFloat())
-        rebuild()
+        return true
+    }
+
+    /** Asks for a locked PDF's password, again while it's wrong. Cancel closes the book. */
+    private fun askPassword() {
+        val field = a.input("Password", password = true).apply { imeOptions = android.view.inputmethod.EditorInfo.IME_ACTION_DONE }
+        val wrong = a.label("That password isn't right. Try again.", 13.5f, Settings.pal.dangerText).apply { gone(true) }
+        val body = a.column().apply {
+            addView(field)
+            addView(wrong, lp(top = a.dp(8)))
+        }
+        var unlocked = false
+        // Tries the password typed: true once the dialog can go (opened, or failed for good).
+        fun attempt(): Boolean {
+            val typed = field.text.toString()
+            if (typed.isEmpty()) return false
+            unlocked = try {
+                open(typed)
+            } catch (e: Exception) {
+                a.toast(e.message ?: "Couldn't open the PDF")
+                return true
+            }
+            if (unlocked) {
+                chrome = false
+                rebuild()
+            } else {
+                field.setText("")
+                wrong.gone(false)
+            }
+            return unlocked
+        }
+        val d = a.dialog("This PDF is locked", "Type its password to open it.", body, ok = "Open") { attempt() }
+        d.setOnDismissListener { if (!unlocked) a.closeReader() }
+        field.setOnEditorActionListener { _, _, _ ->
+            if (attempt()) d.dismiss()
+            true
+        }
+        field.requestFocus()
+        d.window?.setSoftInputMode(android.view.WindowManager.LayoutParams.SOFT_INPUT_STATE_VISIBLE or android.view.WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
     }
 
     override val view: View get() = this
@@ -75,7 +124,7 @@ class PdfScreen(private val a: MainActivity, val workId: String, opened: JSONObj
         pages.recolor()
         top = a.row().apply { setBackgroundColor(p.surface) }
         top.addView(a.iconButton(R.drawable.ic_back, p.text, "Back to library", large = true) { a.closeReader() })
-        top.addView(a.label(meta.optString("title"), 18f, p.text, bold = true, lines = 1).apply { gravity = Gravity.CENTER_VERTICAL },
+        top.addView(a.label(title, 18f, p.text, bold = true, lines = 1).apply { gravity = Gravity.CENTER_VERTICAL },
             LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { leftMargin = a.dp(6) })
         pageLabel = a.label("", 15f, p.muted, lines = 1).apply { setPadding(a.dp(8), 0, a.dp(14), 0) }
         top.addView(pageLabel)
@@ -95,8 +144,13 @@ class PdfScreen(private val a: MainActivity, val workId: String, opened: JSONObj
     /** Updates the page shown in the toolbar and schedules a progress save. */
     fun positionChanged() {
         val n = pages.sizes.size
+        // Locked: nothing to show or save yet.
+        if (n == 0) {
+            pageLabel.text = ""
+            return
+        }
         pageLabel.text = "Page ${min(pages.currentPage() + 1, max(n, 1))} of $n"
-        pages.contentDescription = "${meta.optString("title")}, page ${pages.currentPage() + 1} of $n"
+        pages.contentDescription = "$title, page ${pages.currentPage() + 1} of $n"
         dirty = true
         handler.removeCallbacks(saveLater)
         handler.postDelayed(saveLater, 3000)
@@ -157,6 +211,10 @@ class PdfPages(context: Context, private val screen: PdfScreen) : View(context) 
 
     private val main = Handler(Looper.getMainLooper())
 
+    /** A note, or a comment on a highlight or drawing: what it is, where (in points), and its text. */
+    private class Note(val label: String, val rect: RectF, val text: String)
+    private val notes = HashMap<Int, List<Note>>()
+
     /** A rendered page, or part of one at (x, y) in page pixels, at `scale` pixels per point (no
      *  bitmap if the engine failed on it), and the frame it was last wanted in. */
     private class Shot(val scale: Float, val x: Int, val y: Int, val w: Int, val h: Int, val bitmap: Bitmap?, var used: Long) {
@@ -199,6 +257,8 @@ class PdfPages(context: Context, private val screen: PdfScreen) : View(context) 
     fun recolor() {
         val p = Settings.pal
         val want = when {
+            // Black pages on a black background (OLED Black, High Contrast), grey on other dark themes.
+            p.dark && (p.bg and 0xFFFFFF) == 0 -> 3
             p.dark -> 1
             p.id == "WarmSepia" -> 2
             else -> 0
@@ -382,7 +442,12 @@ class PdfPages(context: Context, private val screen: PdfScreen) : View(context) 
             val bmp = w?.bitmap
             if (bmp != null) c.drawBitmap(bmp, null, r, paint) else {
                 boxPaint.style = Paint.Style.FILL
-                boxPaint.color = if (look == 1) 0xFF262626.toInt() else if (look == 2) 0xFFF7EED6.toInt() else 0xFFFFFFFF.toInt()
+                boxPaint.color = when (look) {
+                    1 -> 0xFF262626.toInt()
+                    2 -> 0xFFF7EED6.toInt()
+                    3 -> 0xFF000000.toInt()
+                    else -> 0xFFFFFFFF.toInt()
+                }
                 c.drawRect(r, boxPaint)
             }
             val ws = wholeScale(i)
@@ -488,6 +553,31 @@ class PdfPages(context: Context, private val screen: PdfScreen) : View(context) 
         }
     }
 
+    /** Shows the note or comment under (x, y) on the screen, if there's one there. */
+    private fun showNoteAt(x: Float, y: Float): Boolean {
+        if (tops.isEmpty()) return false
+        val i = firstPageBelow(scrollPos + y)
+        if (i !in tops.indices) return false
+        val top = tops[i] - scrollPos
+        val left = pageX(i).toFloat()
+        if (y < top || y > top + pageH[i] || x < left || x > left + pageW[i]) return false
+        val list = notes.getOrPut(i) {
+            runCatching {
+                Core.arr("pdf.notes", json("doc" to doc, "page" to i)).objects().map {
+                    val r = it.getJSONArray("rect")
+                    Note(it.getString("label"), RectF(r.getDouble(0).toFloat(), r.getDouble(1).toFloat(), r.getDouble(2).toFloat(), r.getDouble(3).toFloat()), it.getString("text"))
+                }
+            }.getOrDefault(emptyList())
+        }
+        // In points on the page; a finger is wider than a note's icon.
+        val px = (x - left) / scale
+        val py = (y - top) / scale
+        val slop = context.dpf(12) / scale
+        val n = list.lastOrNull { px >= it.rect.left - slop && px <= it.rect.right + slop && py >= it.rect.top - slop && py <= it.rect.bottom + slop } ?: return false
+        context.dialog(n.label, n.text, cancel = "Close")
+        return true
+    }
+
     // ---- touch ----------------------------------------------------------------------------
 
     private val gestures = GestureDetector(context, object : GestureDetector.SimpleOnGestureListener() {
@@ -498,7 +588,7 @@ class PdfPages(context: Context, private val screen: PdfScreen) : View(context) 
 
         // Confirmed, so a double-tap (zoom) doesn't also show and hide the bars.
         override fun onSingleTapConfirmed(e: MotionEvent): Boolean {
-            screen.toggleChrome()
+            if (!showNoteAt(e.x, e.y)) screen.toggleChrome()
             return true
         }
 

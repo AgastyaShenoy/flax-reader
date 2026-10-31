@@ -76,6 +76,8 @@ pub enum ReaderAction {
     /// A page of AO3 comments on a chapter (by AO3's chapter id), or on the whole work.
     LoadComments { chapter_id: Option<String>, page: u32 },
     PostComment { chapter_id: Option<String>, text: String },
+    /// The password typed for a locked PDF.
+    Unlock(String),
 }
 
 /// AO3 comments on the chapter being read, for Contents › Comments.

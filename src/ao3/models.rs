@@ -138,7 +138,8 @@ pub struct WorkMeta {
     pub stats: WorkStats,
     pub is_restricted: bool, // Requires AO3 login
     pub is_complete: bool,
-    /// A PDF (drawn page by page from the file, see `crate::pdf`), with its page count.
+    /// A PDF (drawn page by page from the file, see `crate::pdf`), with its page count: 0 for one
+    /// locked with a password and not opened yet.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pdf_pages: Option<u32>,
 }

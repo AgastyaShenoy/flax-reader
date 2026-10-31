@@ -10,5 +10,5 @@ are copied over by hand; keep local changes small and note them here.
 - `pdf-render`: page layout, the tile cache, render threads, page colours (dark, sepia) and a
   text thread for search and selection.
 
-Local changes:
-- `pdf-engine`: `open_bytes`, for files that only arrive as bytes (Android content URIs).
+Only the PDF parts are copied: not pdfreader's EPUB, comic, DjVu and picture engines, page
+rotation or two-page spreads. Otherwise there are no local changes.

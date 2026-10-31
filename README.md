@@ -167,7 +167,7 @@ The same reader, highlights, dictionary, catalogues, Following and themes, built
 ## 🧭 Features
 
 ### 📖 Reading
-- **EPUB and PDF:** EPUB books with their pictures, headings, lists and tables; PDFs page by page, as they were made (with zoom on Windows).
+- **EPUB and PDF:** EPUB books with their pictures, headings, lists and tables; PDFs page by page, as they were made, with zoom, the notes and comments left in them, password-protected PDFs, and true black pages with the OLED Black theme.
 - **Pages or scroll:** turn pages like a book, with two pages side by side on wide windows, or scroll through each chapter.
 - **Typography:** text size, line height, paragraph spacing, justified text and indents. Use any installed font or a font file on Windows; sans, serif or mono on Android.
 - **Getting around:** contents, bookmarks with notes, and search across the whole book.

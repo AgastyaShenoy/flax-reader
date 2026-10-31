@@ -1,6 +1,7 @@
-//! The book open in the reader: text the reader lays out (EPUB, AO3) or a PDF's pages.
+//! The book open in the reader: text the reader lays out (EPUB, AO3), a PDF's pages, or a PDF
+//! waiting for its password.
 
-use super::pdf::PdfScreen;
+use super::pdf::{LockedPdf, PdfScreen};
 use super::reader::{ReaderAction, ReaderScreen};
 use super::ui::Ui;
 use super::gfx::Rect;
@@ -10,6 +11,7 @@ use crate::storage::config::AppConfig;
 pub enum Book {
     Text(ReaderScreen),
     Pdf(PdfScreen),
+    Locked(LockedPdf),
 }
 
 impl Book {
@@ -43,6 +45,7 @@ impl Book {
         match self {
             Book::Text(r) => r.work_id(),
             Book::Pdf(p) => p.work_id(),
+            Book::Locked(l) => &l.meta.id,
         }
     }
 
@@ -50,6 +53,7 @@ impl Book {
         match self {
             Book::Text(r) => r.progress(),
             Book::Pdf(p) => p.progress(),
+            Book::Locked(l) => l.progress.clone().unwrap_or_default(),
         }
     }
 
@@ -58,6 +62,7 @@ impl Book {
         match self {
             Book::Text(r) => r.progress_dirty,
             Book::Pdf(p) => p.progress_dirty,
+            Book::Locked(_) => false,
         }
     }
 
@@ -65,6 +70,7 @@ impl Book {
         match self {
             Book::Text(r) => r.progress_dirty = false,
             Book::Pdf(p) => p.progress_dirty = false,
+            Book::Locked(_) => {}
         }
     }
 
@@ -72,6 +78,7 @@ impl Book {
         match self {
             Book::Text(r) => r.fullscreen,
             Book::Pdf(p) => p.fullscreen,
+            Book::Locked(_) => false,
         }
     }
 
@@ -80,6 +87,7 @@ impl Book {
         let f = match self {
             Book::Text(r) => &mut r.fullscreen,
             Book::Pdf(p) => &mut p.fullscreen,
+            Book::Locked(_) => return false,
         };
         *f = !*f;
         *f
@@ -89,6 +97,7 @@ impl Book {
         match self {
             Book::Text(t) => t.frame(ui, r, config, bookmarks, highlights),
             Book::Pdf(p) => p.frame(ui, r, config),
+            Book::Locked(l) => l.frame(ui, r),
         }
     }
 }

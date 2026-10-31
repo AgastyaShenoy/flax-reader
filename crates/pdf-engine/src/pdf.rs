@@ -4,8 +4,8 @@ use crate::nav::{self, Nav};
 use crate::raster::{self, DisplayList, GlyphCache, ImageCache, RenderCache, RenderSettings, SharedGlyphs, Target};
 use crate::{Bytes, DocInfo, Engine, OpenError, PageRenderer, PageSize, PixelRect};
 use hayro_interpret::InterpreterSettings;
-use hayro_interpret::hayro_syntax::object::{DateTime, ObjectIdentifier};
-use hayro_interpret::hayro_syntax::{LoadPdfError, Pdf, PdfVersion};
+use hayro_interpret::hayro_syntax::object::{Array, DateTime, Dict, ObjectIdentifier};
+use hayro_interpret::hayro_syntax::{DecryptionError, LoadPdfError, Pdf, PdfVersion};
 use hayro_interpret::util::TransformExt;
 use kurbo::Affine;
 use std::collections::{HashMap, HashSet};
@@ -41,9 +41,10 @@ pub(crate) struct PdfEngine {
 }
 
 impl PdfEngine {
-    pub(crate) fn open(bytes: Arc<Bytes>, display_lists: bool) -> Result<Self, OpenError> {
-        let pdf = Pdf::new(bytes).map_err(|e| match e {
-            LoadPdfError::Decryption(_) => OpenError::Encrypted,
+    pub(crate) fn open(bytes: Arc<Bytes>, display_lists: bool, password: &str) -> Result<Self, OpenError> {
+        let pdf = Pdf::new_with_password(bytes, password).map_err(|e| match e {
+            LoadPdfError::Decryption(DecryptionError::PasswordProtected) => OpenError::NeedsPassword,
+            LoadPdfError::Decryption(_) => OpenError::UnsupportedEncryption,
             LoadPdfError::Invalid => OpenError::Damaged,
         })?;
         let sizes = pdf
@@ -105,8 +106,22 @@ impl Engine for PdfEngine {
         Nav::new(&self.pdf, &self.page_ids).links(page)
     }
 
+    fn page_annotations(&self, page: usize) -> Vec<crate::Annotation> {
+        Nav::new(&self.pdf, &self.page_ids).annotations(page)
+    }
+
     fn outline(&self) -> Vec<crate::OutlineItem> {
         Nav::new(&self.pdf, &self.page_ids).outline()
+    }
+
+    fn has_form(&self) -> bool {
+        let catalog = self.pdf.xref().get::<Dict>(self.pdf.xref().root_id());
+        let fields = catalog.and_then(|c| c.get::<Dict>("AcroForm")).and_then(|f| f.get::<Array>("Fields"));
+        fields.is_some_and(|f| f.raw_iter().next().is_some())
+    }
+
+    fn page_transform(&self, page: usize) -> Option<[f64; 6]> {
+        Some(self.pdf.pages().get(page)?.initial_transform(true).to_kurbo().as_coeffs())
     }
 
     fn info(&self) -> DocInfo {

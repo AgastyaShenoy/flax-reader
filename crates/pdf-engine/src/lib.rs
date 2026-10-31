@@ -56,6 +56,12 @@ pub trait Engine: Send + Sync {
         Vec::new()
     }
 
+    /// The page's annotations that a reader can remove: notes, highlights, drawings and the like;
+    /// not links, form fields or the pop-ups that belong to notes.
+    fn page_annotations(&self, _page: usize) -> Vec<Annotation> {
+        Vec::new()
+    }
+
     /// The document's outline (bookmarks), if it has one.
     fn outline(&self) -> Vec<OutlineItem> {
         Vec::new()
@@ -64,6 +70,17 @@ pub trait Engine: Send + Sync {
     /// What the document says about itself.
     fn info(&self) -> DocInfo {
         DocInfo::default()
+    }
+
+    /// Whether the document has a form to fill in.
+    fn has_form(&self) -> bool {
+        false
+    }
+
+    /// How the page's own coordinates (PDF user space: points, y up) map to points from the
+    /// top-left of the page as shown: x' = a x + c y + e, y' = b x + d y + f, as [a, b, c, d, e, f].
+    fn page_transform(&self, _page: usize) -> Option<[f64; 6]> {
+        None
     }
 }
 
@@ -92,6 +109,19 @@ pub enum Target {
     Page { page: usize, y: Option<f32> },
     /// A web address or another URI, as written in the PDF.
     Uri(String),
+}
+
+/// An annotation in a PDF.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Annotation {
+    /// Its place in the page's list of annotations, every kind counted.
+    pub index: usize,
+    /// The PDF's name for its kind: Text (a note), Highlight, Ink, FreeText…
+    pub kind: String,
+    /// x0, y0, x1, y1 in points from the page's top-left corner.
+    pub rect: [f32; 4],
+    /// Its text: a note's, or a comment on a highlight.
+    pub contents: String,
 }
 
 /// A clickable area on a page.
@@ -153,8 +183,10 @@ pub enum OpenError {
     Io(std::io::Error),
     /// No engine reads this format.
     Unsupported,
-    /// Needs a password.
-    Encrypted,
+    /// Needs a password, or the one given is wrong.
+    NeedsPassword,
+    /// Encrypted in a way this engine can't decrypt.
+    UnsupportedEncryption,
     Damaged,
 }
 
@@ -163,7 +195,8 @@ impl fmt::Display for OpenError {
         match self {
             OpenError::Io(e) => e.fmt(f),
             OpenError::Unsupported => f.write_str("not a PDF"),
-            OpenError::Encrypted => f.write_str("it's password-protected"),
+            OpenError::NeedsPassword => f.write_str("it needs a password"),
+            OpenError::UnsupportedEncryption => f.write_str("it's encrypted in a way this reader can't open"),
             OpenError::Damaged => f.write_str("the file is damaged"),
         }
     }
@@ -195,6 +228,25 @@ pub fn open(path: &Path) -> Result<Arc<dyn Engine>, OpenError> {
 }
 
 pub fn open_with(path: &Path, options: Options) -> Result<Arc<dyn Engine>, OpenError> {
+    open_inner(path, options, "")
+}
+
+/// Opens a password-protected document. Either of its passwords works: the one for reading or the
+/// owner's.
+pub fn open_with_password(path: &Path, password: &str) -> Result<Arc<dyn Engine>, OpenError> {
+    open_inner(path, Options::default(), password)
+}
+
+/// Opens a PDF held in memory: one with changes not saved to its file yet.
+pub fn open_pdf_bytes(data: Vec<u8>, password: &str) -> Result<Arc<dyn Engine>, OpenError> {
+    let head = &data[..data.len().min(1024)];
+    if !head.windows(5).any(|w| w == b"%PDF-") {
+        return Err(OpenError::Unsupported);
+    }
+    Ok(Arc::new(pdf::PdfEngine::open(Arc::new(Bytes::Read(data)), Options::default().display_lists, password)?))
+}
+
+fn open_inner(path: &Path, options: Options, password: &str) -> Result<Arc<dyn Engine>, OpenError> {
     let mut file = File::open(path)?;
     let len = file.metadata()?.len();
     let bytes = if len > MAP_ABOVE {
@@ -206,20 +258,10 @@ pub fn open_with(path: &Path, options: Options) -> Result<Arc<dyn Engine>, OpenE
         file.read_to_end(&mut v)?;
         Bytes::Read(v)
     };
-    open_from(bytes, options)
-}
-
-/// Opens a PDF that's already in memory (some sources, like Android's content URIs, only give
-/// bytes).
-pub fn open_bytes(data: Vec<u8>, options: Options) -> Result<Arc<dyn Engine>, OpenError> {
-    open_from(Bytes::Read(data), options)
-}
-
-fn open_from(bytes: Bytes, options: Options) -> Result<Arc<dyn Engine>, OpenError> {
     // the header may follow some junk, which readers accept
     let head = &bytes.as_ref()[..bytes.as_ref().len().min(1024)];
     if head.windows(5).any(|w| w == b"%PDF-") {
-        return Ok(Arc::new(pdf::PdfEngine::open(Arc::new(bytes), options.display_lists)?));
+        return Ok(Arc::new(pdf::PdfEngine::open(Arc::new(bytes), options.display_lists, password)?));
     }
     Err(OpenError::Unsupported)
 }

@@ -225,8 +225,10 @@ private fun workCard(a: MainActivity, e: JSONObject, collections: List<JSONObjec
     card.addView(top)
 
     val fandoms = m.getJSONArray("fandoms").strings().take(2)
-    val by = "by " + m.getJSONArray("authors").strings().joinToString(", ") + if (fandoms.isNotEmpty()) "  ·  " + fandoms.joinToString(", ") else ""
-    card.addView(a.label(by, 13f, p.muted, lines = 1), lp(top = a.dp(2)))
+    val authors = m.getJSONArray("authors").strings()
+    // No "by" for a book that names no author (a PDF that doesn't say).
+    val by = listOfNotNull(authors.takeIf { it.isNotEmpty() }?.let { "by " + it.joinToString(", ") }, fandoms.takeIf { it.isNotEmpty() }?.joinToString(", ")).joinToString("  ·  ")
+    if (by.isNotEmpty()) card.addView(a.label(by, 13f, p.muted, lines = 1), lp(top = a.dp(2)))
 
     card.addView(a.pillScroller(workPills(a, m)), lp(top = a.dp(10)))
 
@@ -236,10 +238,12 @@ private fun workCard(a: MainActivity, e: JSONObject, collections: List<JSONObjec
     val started = e.getInt("chapter") > 1 || e.getDouble("percentage") > 0 || e.getDouble("position") > 0
     val completed = e.getBoolean("completed")
     val pct = e.getDouble("percentage")
-    // A PDF counts pages instead of chapters and words.
+    // A PDF counts pages instead of chapters and words (none yet if it's locked and not opened).
+    val isPdf = !m.isNull("pdf_pages")
     val pdfPages = m.optInt("pdf_pages", 0)
     val status = when {
         completed -> "Finished"
+        isPdf && pdfPages == 0 -> "Locked with a password"
         pdfPages > 0 && started -> "Page ${minOf(e.getDouble("position").toInt() + 1, pdfPages)} of $pdfPages  ·  ${pct.toInt()}%"
         pdfPages > 0 -> "$pdfPages pages  ·  not started"
         started -> "Chapter ${e.getInt("chapter")} of ${m.getInt("chapters")}  ·  ${pct.toInt()}%"
@@ -255,7 +259,7 @@ private fun workCard(a: MainActivity, e: JSONObject, collections: List<JSONObjec
     }, LinearLayout.LayoutParams(0, a.dp(4), 1f).apply { leftMargin = a.dp(12) })
     card.addView(prog, lp(top = a.dp(12)))
     val stats = when {
-        pdfPages > 0 -> "PDF"
+        isPdf -> "PDF"
         // Brought in from a list on a site (AO3 bookmarks, watched threads): opening downloads it.
         !e.optBoolean("downloaded", true) -> "Not downloaded yet: opening it downloads it"
         else -> "${thousands(m.getLong("words"))} words" + if (m.getLong("kudos") > 0) "  ·  ${thousands(m.getLong("kudos"))} kudos" else ""

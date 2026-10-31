@@ -8,13 +8,13 @@ use super::mark;
 use super::library::{ExportFormat, LibraryAction, LibraryScreen};
 use super::book::Book;
 use super::catalog::{CatalogAction, CatalogScreen, Getting};
-use super::pdf::PdfScreen;
+use super::pdf::{LockedPdf, PdfScreen};
 use super::reader::{ReaderAction, ReaderScreen};
 use super::settings::{SettingsAction, SettingsCtx, SettingsScreen};
 use super::ui::*;
 use super::worker::Worker;
 use crate::ao3::client::Ao3Client;
-use crate::ao3::models::{ShelfStatus, UserSession, Work, WorkMeta};
+use crate::ao3::models::{ReadingProgress, ShelfStatus, UserSession, Work, WorkMeta};
 use crate::ao3::search::{Feed, FeedKind, Listing};
 use crate::storage::follows::{FollowStore, Scope, STALE_MINUTES};
 use crate::storage::export::WorkExporter;
@@ -517,17 +517,11 @@ impl App {
         let title = work.meta.title.clone();
         if work.meta.is_pdf() {
             match crate::pdf::open(&id) {
-                Ok(engine) => {
-                    // Render threads wake the window when pages are ready.
-                    let hwnd = self.hwnd;
-                    let wake = move || unsafe {
-                        use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
-                        let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(Some(HWND(hwnd as *mut _)), super::worker::WM_APP_RESULT, WPARAM(0), LPARAM(0));
-                    };
-                    self.reader = Some(Book::Pdf(PdfScreen::new(work.meta, engine, progress.as_ref(), wake)));
-                }
+                Ok(engine) => self.show_pdf(work.meta, engine, progress.as_ref()),
+                // Locked: the reader asks for its password (`unlock_pdf`).
+                Err(crate::pdf::OpenError::NeedsPassword) => self.reader = Some(Book::Locked(LockedPdf::new(work.meta, progress))),
                 Err(e) => {
-                    self.set_toast(e);
+                    self.set_toast(format!("Couldn't open the PDF: {e}"));
                     return;
                 }
             }
@@ -538,6 +532,39 @@ impl App {
         let _ = self.follows.mark_work_read(&id);
         self.tab = Tab::Reader;
         self.deferred.push(Deferred::SetTitle(format!("{title} — Flax Reader")));
+    }
+
+    /// Shows an open PDF in the reader.
+    fn show_pdf(&mut self, meta: WorkMeta, engine: std::sync::Arc<dyn crate::pdf::Engine>, progress: Option<&ReadingProgress>) {
+        // Render threads wake the window when pages are ready.
+        let hwnd = self.hwnd;
+        let wake = move || unsafe {
+            use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+            let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(Some(HWND(hwnd as *mut _)), super::worker::WM_APP_RESULT, WPARAM(0), LPARAM(0));
+        };
+        self.reader = Some(Book::Pdf(PdfScreen::new(meta, engine, progress, wake)));
+    }
+
+    /// The password typed for the locked PDF in the reader: opens it, or says it's wrong.
+    fn unlock_pdf(&mut self, password: &str) {
+        let Some(Book::Locked(lock)) = &mut self.reader else { return };
+        match crate::pdf::unlock(&lock.meta.id, password) {
+            Ok(engine) => {
+                let (mut meta, progress) = (lock.meta.clone(), lock.progress.clone());
+                // Imported while locked: now its pages, title and author can be read.
+                if crate::pdf::is_locked(&meta) {
+                    crate::pdf::describe(&mut meta, engine.as_ref());
+                    if let Some(mut work) = self.library.load_work(&meta.id) {
+                        work.meta = meta.clone();
+                        let _ = self.library.save_work(&work);
+                    }
+                    self.deferred.push(Deferred::SetTitle(format!("{} — Flax Reader", meta.title)));
+                }
+                self.show_pdf(meta, engine, progress.as_ref());
+            }
+            Err(crate::pdf::OpenError::NeedsPassword) => lock.wrong = true,
+            Err(e) => self.set_toast(format!("Couldn't open the PDF: {e}")),
+        }
     }
 
     pub fn open_work(&mut self, work_id: &str) {
@@ -631,6 +658,7 @@ impl App {
                     self.settings.show_typography();
                 }
                 ReaderAction::Notice(msg) => self.set_toast(msg),
+                ReaderAction::Unlock(password) => self.unlock_pdf(&password),
                 ReaderAction::SaveHighlight(h) => self.library.save_highlight(&work_id, h),
                 ReaderAction::RemoveHighlight(hid) => self.library.remove_highlight(&work_id, &hid),
                 ReaderAction::Copy(text) => self.deferred.push(Deferred::Copy(text)),

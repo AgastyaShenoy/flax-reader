@@ -2,7 +2,7 @@
 //! catalog's outline tree, and the destinations both point to (explicit, or named in the catalog's
 //! `Dests` dictionary or `Names` tree).
 
-use crate::{Link, OutlineItem, Target};
+use crate::{Annotation, Link, OutlineItem, Target};
 use hayro_interpret::hayro_syntax::Pdf;
 use hayro_interpret::hayro_syntax::object::{Array, Dict, MaybeRef, Name, Object, ObjectIdentifier};
 use hayro_interpret::util::TransformExt;
@@ -50,6 +50,30 @@ impl<'a> Nav<'a> {
             }
         }
         links
+    }
+
+    pub(crate) fn annotations(&self, page: usize) -> Vec<Annotation> {
+        let Some(p) = self.pdf.pages().get(page) else { return Vec::new() };
+        let Some(annots) = p.raw().get::<Array>("Annots") else { return Vec::new() };
+        let to_page = p.initial_transform(true).to_kurbo();
+        let mut found = Vec::new();
+        // one at a time, so the count matches the array's even past an entry that isn't a dictionary
+        let mut items = annots.flex_iter();
+        for index in 0.. {
+            let Some(annot) = items.next::<Dict>() else { break };
+            let kind = annot.get::<Name>("Subtype").map(|n| String::from_utf8_lossy(n.as_ref()).into_owned()).unwrap_or_default();
+            // hidden ones aren't drawn, so they aren't offered either
+            if matches!(kind.as_str(), "Link" | "Widget" | "Popup" | "") || annot.get::<u32>("F").unwrap_or(0) & 2 != 0 {
+                continue;
+            }
+            let Some([x0, y0, x1, y1]) = annot.get::<[f64; 4]>("Rect") else { continue };
+            let r = to_page.transform_rect_bbox(Rect::new(x0, y0, x1, y1));
+            let contents = annot
+                .get::<hayro_interpret::hayro_syntax::object::String>("Contents")
+                .map_or_else(String::new, |t| text_string(t.as_bytes()).trim().to_owned());
+            found.push(Annotation { index, kind, rect: [r.x0 as f32, r.y0 as f32, r.x1 as f32, r.y1 as f32], contents });
+        }
+        found
     }
 
     pub(crate) fn outline(&self) -> Vec<OutlineItem> {

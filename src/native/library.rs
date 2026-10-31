@@ -357,10 +357,15 @@ fn card(ui: &mut Ui, r: Rect, e: &LibraryEntry, confirming: bool, collections: &
     if tresp.clicked {
         out.push(LibraryAction::Open(wid.clone()));
     }
-    let mut byline = format!("by {}", m.authors.join(", "));
-    if !m.fandoms.is_empty() {
-        byline.push_str(&format!("  ·  {}", m.fandoms.iter().take(3).cloned().collect::<Vec<_>>().join(", ")));
+    // No "by" for a book that names no author (a PDF that doesn't say).
+    let mut parts = Vec::new();
+    if !m.authors.is_empty() {
+        parts.push(format!("by {}", m.authors.join(", ")));
     }
+    if !m.fandoms.is_empty() {
+        parts.push(m.fandoms.iter().take(3).cloned().collect::<Vec<_>>().join(", "));
+    }
+    let byline = parts.join("  ·  ");
     ui.text_opts(&byline, &TextStyle::ui(13.0), TextOpts::ellipsize(tw), r.x + 16.0, r.y + 44.0, c.muted);
 
     // Tag pills on one row: whole pills only, then "+2" for the rest.
@@ -435,6 +440,8 @@ fn card(ui: &mut Ui, r: Rect, e: &LibraryEntry, confirming: bool, collections: &
     let total_ch = m.stats.chapters_published.max(1);
     let status = match (p.completed, started, m.pdf_pages) {
         (true, _, _) => "Finished".to_string(),
+        // Imported locked: its pages are counted once its password opens it.
+        (_, _, Some(0)) => "Locked with a password".to_string(),
         (_, true, Some(n)) => format!("Page {} of {n}  ·  {:.0}%", (p.position.floor() as u32 + 1).min(n), p.percentage),
         (_, false, Some(n)) => format!("{n} pages  ·  not started"),
         (_, true, None) => format!("Chapter {} of {}  ·  {:.0}%", p.current_chapter, total_ch, p.percentage),

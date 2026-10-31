@@ -102,6 +102,8 @@ struct PdfTiles {
     /// Which opening of a PDF this is, so the page view of a closed one gets nothing.
     doc: i32,
     pages: usize,
+    /// The document, for the notes on its pages.
+    engine: std::sync::Arc<dyn ao3reader::pdf::Engine>,
     pool: ao3reader::pdf::RenderPool,
     /// Tiles finished and not yet handed over.
     done: Mutex<std::collections::VecDeque<ao3reader::pdf::Done>>,
@@ -111,9 +113,9 @@ struct PdfTiles {
 
 static PDF_DOCS: AtomicUsize = AtomicUsize::new(0);
 
-fn open_pdf(id: &str) -> Result<(i32, Vec<Value>), String> {
+/// Starts the render threads for a PDF just opened: its number and its pages' sizes.
+fn open_pdf(engine: std::sync::Arc<dyn ao3reader::pdf::Engine>) -> Result<(i32, Vec<Value>), String> {
     close_pdf();
-    let engine = ao3reader::pdf::open(id)?;
     let pages = engine.page_count();
     let sizes = (0..pages).map(|p| engine.page_size(p)).map(|s| json!([s.width, s.height])).collect();
     let wake = std::sync::Arc::new((Mutex::new((false, false)), std::sync::Condvar::new()));
@@ -121,14 +123,14 @@ fn open_pdf(id: &str) -> Result<(i32, Vec<Value>), String> {
     // Two pages at once (the two on screen) when there are cores to spare. Each thread holds a
     // page's worth of scratch memory while it works, so no more.
     let threads = std::thread::available_parallelism().map_or(1, |n| n.get() / 2).clamp(1, 2);
-    let pool = ao3reader::pdf::RenderPool::new(engine, threads, move || {
+    let pool = ao3reader::pdf::RenderPool::new(engine.clone(), threads, move || {
         if let Ok(mut w) = ping.0.lock() {
             w.0 = true;
         }
         ping.1.notify_all();
     });
     let doc = PDF_DOCS.fetch_add(1, Relaxed) as i32 + 1;
-    *PDF.lock().map_err(|_| "pdf poisoned")? = Some(std::sync::Arc::new(PdfTiles { doc, pages, pool, done: Mutex::default(), wake }));
+    *PDF.lock().map_err(|_| "pdf poisoned")? = Some(std::sync::Arc::new(PdfTiles { doc, pages, engine, pool, done: Mutex::default(), wake }));
     Ok((doc, sizes))
 }
 
@@ -149,7 +151,7 @@ fn open_tiles(doc: i32) -> Option<std::sync::Arc<PdfTiles>> {
 /// The parts of pages the page view wants rendered, most important first, replacing the ones it
 /// wanted before: (page, column, row, x, y, width, height, scale) for each, the column and row
 /// naming the part, x to height in page pixels at the scale (pixels per point, as f32 bits).
-/// Coloured for the theme (`look`: 0 as printed, 1 dark, 2 sepia).
+/// Coloured for the theme (`look`: 0 as printed, 1 dark, 2 sepia, 3 black).
 pub fn pdf_want(doc: i32, look: u8, jobs: &[i32]) {
     use ao3reader::pdf::{Job, PixelRect, TileKey};
     let Some(t) = open_tiles(doc) else { return };
@@ -1086,8 +1088,39 @@ fn dispatch(method: &str, a: &Value) -> R {
             })
         }
         "pdf.open" => {
-            let (doc, sizes) = open_pdf(arg_str(a, "id")?)?;
-            Ok(json!({ "doc": doc, "sizes": sizes }))
+            let id = arg_str(a, "id")?;
+            let opened = match a.get("password").and_then(Value::as_str) {
+                Some(password) => ao3reader::pdf::unlock(id, password),
+                None => ao3reader::pdf::open(id),
+            };
+            let engine = match opened {
+                Ok(engine) => engine,
+                // Locked, or the password given is wrong: the page view asks for it.
+                Err(ao3reader::pdf::OpenError::NeedsPassword) => return Ok(json!({ "locked": true })),
+                Err(e) => return Err(format!("Couldn't open the PDF: {e}")),
+            };
+            // Imported while locked: now its pages, title and author can be read.
+            let title = with_state(|s| {
+                let work = s.work.as_mut().ok_or("no work open")?;
+                if ao3reader::pdf::is_locked(&work.meta) {
+                    ao3reader::pdf::describe(&mut work.meta, engine.as_ref());
+                    s.library.save_work(work)?;
+                }
+                Ok(work.meta.title.clone())
+            })?;
+            let (doc, sizes) = open_pdf(engine)?;
+            Ok(json!({ "doc": doc, "sizes": sizes, "title": title }))
+        }
+        // Notes on a page, and comments on its highlights and drawings: where they are, in points
+        // from its top-left corner, and what they say.
+        "pdf.notes" => {
+            let t = open_tiles(arg_u64(a, "doc")? as i32).ok_or("the PDF is closed")?;
+            let page = arg_u64(a, "page")? as usize;
+            if page >= t.pages {
+                return Ok(json!([]));
+            }
+            let notes = ao3reader::pdf::page_notes(t.engine.as_ref(), page);
+            Ok(Value::Array(notes.iter().map(|n| json!({ "label": ao3reader::pdf::annotation_label(&n.kind), "rect": n.rect, "text": n.contents.trim() })).collect()))
         }
         "pdf.close" => {
             close_pdf();

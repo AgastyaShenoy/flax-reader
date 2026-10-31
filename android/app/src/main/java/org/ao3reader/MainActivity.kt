@@ -390,7 +390,7 @@ class MainActivity : Activity() {
         }
         runCatching { Core.req("follows.read", json("work" to id)) }
         // PDFs show their pages as they are; everything else is laid out as text.
-        val isPdf = opened.getJSONObject("meta").optInt("pdf_pages", 0) > 0
+        val isPdf = !opened.getJSONObject("meta").isNull("pdf_pages")
         val r: BookView = try {
             if (isPdf) PdfScreen(this, id, opened) else ReaderScreen(this, id, opened)
         } catch (e: Exception) {

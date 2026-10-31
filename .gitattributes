@@ -1,0 +1,2 @@
+# Test PDFs must keep their exact bytes (no CRLF conversion).
+*.pdf binary

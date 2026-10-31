@@ -1,14 +1,16 @@
 //! The PDF reader: pages as they are, in one scrolling column, rendered in tiles on background
 //! threads by the engine from the pdfreader project (`crates/pdf-engine`, `crates/pdf-render`).
+//! Notes and comments in the PDF show as tooltips; a locked PDF asks for its password first.
 
 use super::gfx::*;
 use super::reader::ReaderAction;
 use super::ui::*;
 use crate::ao3::models::{ReadingProgress, WorkMeta};
-use crate::pdf::{Engine, PageSize};
-use crate::reader::theme::ReaderThemeType;
+use crate::pdf::{Annotation, Engine, PageSize};
+use crate::reader::theme::{ReaderThemeType, Rgb};
 use crate::storage::config::AppConfig;
 use pdf_render::{compose, wanted_tiles, Frame, Layout, Look, RenderPool, Style, TileCache, Viewport};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 const TOOLBAR_H: f32 = 48.0;
@@ -129,6 +131,8 @@ pub struct PdfScreen {
     buf: Vec<u32>,
     /// The scroll bar's thumb is being dragged: where it was grabbed.
     grab: Option<f32>,
+    /// Annotations with something to say, by page, for the pages looked at so far.
+    notes: HashMap<usize, Vec<Annotation>>,
     pub progress_dirty: bool,
     pub fullscreen: bool,
 }
@@ -167,6 +171,7 @@ impl PdfScreen {
             anchor: 0.0,
             buf: Vec::new(),
             grab: None,
+            notes: HashMap::new(),
             progress_dirty: false,
             fullscreen: false,
         }
@@ -282,7 +287,10 @@ impl PdfScreen {
             self.cache.set_budget(6 * vw as usize * vh as usize * 4);
             self.cache.begin_frame();
             let pal = config.palette();
-            let look = if pal.is_dark {
+            // Black pages on a black background (OLED Black, High Contrast), grey on other dark themes.
+            let look = if pal.is_dark && pal.bg == Rgb(0, 0, 0) {
+                Look::Black
+            } else if pal.is_dark {
                 Look::Dark
             } else if config.theme == ReaderThemeType::WarmSepia {
                 Look::Sepia
@@ -298,6 +306,7 @@ impl PdfScreen {
             ui.g.draw_pixels(&self.buf, vw, vh, area);
         }
         self.scrollbar(ui, area, vh as i64);
+        self.note_tips(ui, area, &view, px);
 
         // Where the reader is, for the library and the toolbar.
         let layout = self.layout.as_ref().unwrap();
@@ -317,6 +326,40 @@ impl PdfScreen {
             self.side_panel(ui, panel_r);
         }
         out
+    }
+
+    /// A note's text, or the comment on a highlight or drawing, as a tooltip over it.
+    fn note_tips(&mut self, ui: &mut Ui, area: Rect, view: &Viewport, px: f32) {
+        if self.panel && self.panel_rect(area).contains(ui.input.mouse) {
+            return;
+        }
+        let Some(layout) = &self.layout else { return };
+        if layout.pages.is_empty() {
+            return;
+        }
+        let s = layout.scale;
+        for page in layout.page_at(view.y)..layout.pages.len() {
+            let pos = layout.pages[page];
+            if pos.y > view.y + view.height as i64 {
+                break;
+            }
+            let notes = self.notes.entry(page).or_insert_with(|| crate::pdf::page_notes(self.engine.as_ref(), page));
+            for (i, n) in notes.iter().enumerate() {
+                // points on the page to DIPs in the window, kept inside the pages' area
+                let x0 = (area.x + ((pos.x - view.x) as f32 + n.rect[0] * s) / px).max(area.x);
+                let y0 = (area.y + ((pos.y - view.y) as f32 + n.rect[1] * s) / px).max(area.y);
+                let x1 = (area.x + ((pos.x - view.x) as f32 + n.rect[2] * s) / px).min(area.right());
+                let y1 = (area.y + ((pos.y - view.y) as f32 + n.rect[3] * s) / px).min(area.bottom());
+                if x1 <= x0 || y1 <= y0 {
+                    continue;
+                }
+                let r = Rect::new(x0, y0, x1 - x0, y1 - y0);
+                // Text to a screen reader, a tooltip to the mouse.
+                let nid = id2(id2(id("pdf-note"), page), i);
+                ui.interact_as(nid, r, Role::Text, &n.contents);
+                ui.tip(nid, r, &n.contents);
+            }
+        }
     }
 
     fn panel_rect(&self, area: Rect) -> Rect {
@@ -569,5 +612,60 @@ impl PdfScreen {
                 self.goto = Some(String::new());
             }
         }
+    }
+}
+
+/// A PDF locked with a password, asking for it in place of its pages.
+pub struct LockedPdf {
+    pub meta: WorkMeta,
+    /// Where the reader was, for when it opens.
+    pub progress: Option<ReadingProgress>,
+    /// The last password tried was wrong.
+    pub wrong: bool,
+    typed: String,
+    focused: bool,
+}
+
+impl LockedPdf {
+    pub fn new(meta: WorkMeta, progress: Option<ReadingProgress>) -> Self {
+        Self { meta, progress, wrong: false, typed: String::new(), focused: false }
+    }
+
+    /// The toolbar, and a card asking for the password: Enter or Open tries it.
+    pub fn frame(&mut self, ui: &mut Ui, r: Rect) -> Vec<ReaderAction> {
+        let mut out = Vec::new();
+        let c = ui.c;
+        let bar = Rect::new(r.x, r.y, r.w, TOOLBAR_H);
+        ui.g.fill_rect(bar, c.surface);
+        ui.separator(bar.x, bar.bottom() - 1.0, bar.w);
+        if ui.button_ex(id("pdf-back"), Rect::new(r.x + 8.0, r.y + 8.0, 96.0, 32.0), "Library", Some("\u{E72B}"), ButtonKind::Ghost, true) {
+            out.push(ReaderAction::Close);
+        }
+        let tt = ui.measure(&self.meta.title, &TextStyle::ui(14.0).semibold(), TextOpts::ellipsize((r.w - 260.0).max(40.0)));
+        ui.g.draw_text(tt, r.x + (r.w - tt.w) / 2.0, r.y + (TOOLBAR_H - tt.h) / 2.0, c.text);
+
+        let (w, h) = (400.0f32.min(r.w - 32.0), 214.0);
+        let card = Rect::new(r.x + (r.w - w) / 2.0, r.y + TOOLBAR_H + ((r.h - TOOLBAR_H - h) / 2.0).max(16.0), w, h);
+        ui.g.fill_round(card, 12.0, c.card);
+        ui.g.stroke_round(card, 12.0, 1.0, c.border);
+        let x = card.x + 24.0;
+        ui.text("\u{E72E}", &TextStyle::icons(18.0), x, card.y + 25.0, c.text);
+        ui.text("This PDF is locked", &TextStyle::ui(17.0).semibold(), x + 30.0, card.y + 22.0, c.text);
+        let (msg, color) = if self.wrong { ("That password isn't right. Try again.", c.danger_text) } else { ("Type its password to open it.", c.muted) };
+        ui.text(msg, &TextStyle::ui(13.5), x, card.y + 62.0, color);
+        let input = ui.text_input(id("pdf-password"), Rect::new(x, card.y + 92.0, card.w - 48.0, 36.0), &mut self.typed, "Password", true);
+        if !self.focused {
+            ui.focus_input(id("pdf-password"));
+            self.focused = true;
+        }
+        let bw = ui.button_width("Open", None).max(96.0);
+        let can = !self.typed.is_empty();
+        let open = ui.button_ex(id("pdf-unlock"), Rect::new(card.right() - 24.0 - bw, card.y + 150.0, bw, 36.0), "Open", None, ButtonKind::Primary, can);
+        if can && (open || input.submitted) {
+            out.push(ReaderAction::Unlock(std::mem::take(&mut self.typed)));
+        } else if input.escaped {
+            out.push(ReaderAction::Close);
+        }
+        out
     }
 }
