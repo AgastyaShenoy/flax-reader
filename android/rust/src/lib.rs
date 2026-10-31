@@ -94,27 +94,136 @@ struct State {
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
 
-/// The PDF open in the reader. Kept apart from the state so pages render without holding its lock.
-static PDF: Mutex<Option<std::sync::Arc<dyn ao3reader::pdf::Engine>>> = Mutex::new(None);
+/// The PDF open in the reader: the desktop's render threads, drawing the tiles the page view asks
+/// for. Kept apart from the state so pages render without holding its lock.
+static PDF: Mutex<Option<std::sync::Arc<PdfTiles>>> = Mutex::new(None);
 
-/// Renders part of a page of the open PDF at `scale` pixels per point: (x, y, width, height) in
-/// whole-page pixels, coloured for the theme (`look`: 0 as printed, 1 dark, 2 sepia). Returns ARGB
-/// pixels (Android's `Bitmap.setPixels` order), or None if there's no such page or the engine
-/// failed on it.
-pub fn render_pdf(page: usize, scale: f32, area: (u32, u32, u32, u32), look: u8) -> Option<Vec<i32>> {
-    use ao3reader::pdf::PixelRect;
-    let engine = PDF.lock().ok()?.clone()?;
-    if page >= engine.page_count() || area.2 == 0 || area.3 == 0 {
-        return None;
+struct PdfTiles {
+    /// Which opening of a PDF this is, so the page view of a closed one gets nothing.
+    doc: i32,
+    pages: usize,
+    pool: ao3reader::pdf::RenderPool,
+    /// Tiles finished and not yet handed over.
+    done: Mutex<std::collections::VecDeque<ao3reader::pdf::Done>>,
+    /// (a tile finished, the PDF closed), and the page view's tile thread waiting for either.
+    wake: std::sync::Arc<(Mutex<(bool, bool)>, std::sync::Condvar)>,
+}
+
+static PDF_DOCS: AtomicUsize = AtomicUsize::new(0);
+
+fn open_pdf(id: &str) -> Result<(i32, Vec<Value>), String> {
+    close_pdf();
+    let engine = ao3reader::pdf::open(id)?;
+    let pages = engine.page_count();
+    let sizes = (0..pages).map(|p| engine.page_size(p)).map(|s| json!([s.width, s.height])).collect();
+    let wake = std::sync::Arc::new((Mutex::new((false, false)), std::sync::Condvar::new()));
+    let ping = wake.clone();
+    // Two pages at once (the two on screen) when there are cores to spare. Each thread holds a
+    // page's worth of scratch memory while it works, so no more.
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get() / 2).clamp(1, 2);
+    let pool = ao3reader::pdf::RenderPool::new(engine, threads, move || {
+        if let Ok(mut w) = ping.0.lock() {
+            w.0 = true;
+        }
+        ping.1.notify_all();
+    });
+    let doc = PDF_DOCS.fetch_add(1, Relaxed) as i32 + 1;
+    *PDF.lock().map_err(|_| "pdf poisoned")? = Some(std::sync::Arc::new(PdfTiles { doc, pages, pool, done: Mutex::default(), wake }));
+    Ok((doc, sizes))
+}
+
+fn close_pdf() {
+    let old = PDF.lock().ok().and_then(|mut p| p.take());
+    if let Some(t) = old {
+        if let Ok(mut w) = t.wake.0.lock() {
+            w.1 = true;
+        }
+        t.wake.1.notify_all();
     }
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let mut r = engine.renderer();
-        let mut px = r.render(page, scale, PixelRect { x: area.0, y: area.1, width: area.2, height: area.3 });
-        ao3reader::pdf::Look::from_u8(look).apply(&mut px);
-        // 0x00RRGGBB, made opaque.
-        px.into_iter().map(|p| (p | 0xFF00_0000) as i32).collect()
-    }))
-    .ok()
+}
+
+fn open_tiles(doc: i32) -> Option<std::sync::Arc<PdfTiles>> {
+    PDF.lock().ok()?.clone().filter(|t| t.doc == doc)
+}
+
+/// The parts of pages the page view wants rendered, most important first, replacing the ones it
+/// wanted before: (page, column, row, x, y, width, height, scale) for each, the column and row
+/// naming the part, x to height in page pixels at the scale (pixels per point, as f32 bits).
+/// Coloured for the theme (`look`: 0 as printed, 1 dark, 2 sepia).
+pub fn pdf_want(doc: i32, look: u8, jobs: &[i32]) {
+    use ao3reader::pdf::{Job, PixelRect, TileKey};
+    let Some(t) = open_tiles(doc) else { return };
+    let u = |v: i32| v.max(0) as u32;
+    let jobs = jobs
+        .chunks_exact(8)
+        .filter(|j| j[5] > 0 && j[6] > 0 && (j[0] as usize) < t.pages)
+        .map(|j| Job {
+            key: TileKey { page: u(j[0]) as usize, scale: j[7] as u32, col: u(j[1]), row: u(j[2]), look },
+            area: PixelRect { x: u(j[3]), y: u(j[4]), width: u(j[5]), height: u(j[6]) },
+        })
+        .collect();
+    t.pool.set_jobs(jobs);
+}
+
+/// Waits for the next rendered part: (page, column, row, look, scale as f32 bits, width, height)
+/// then its ARGB pixels, none if the engine failed on it. None once the PDF is closed.
+pub fn pdf_tile(doc: i32) -> Option<Vec<i32>> {
+    let t = open_tiles(doc)?;
+    // Half-second waits with nothing rendered, since the last part was handed over.
+    let mut quiet = 0;
+    loop {
+        let next = t.done.lock().ok()?.pop_front();
+        if let Some(d) = next {
+            let (w, h) = (d.width, d.height);
+            let mut out = vec![d.key.page as i32, d.key.col as i32, d.key.row as i32, i32::from(d.key.look), d.key.scale as i32, w as i32, h as i32];
+            if !d.pixels.is_empty() {
+                let mut row = vec![0u32; w as usize];
+                out.reserve((w * h) as usize);
+                for y in 0..h {
+                    d.pixels.read_row(w, y, 0, &mut row);
+                    // 0x00RRGGBB, made opaque.
+                    out.extend(row.iter().map(|&p| (p | 0xFF00_0000) as i32));
+                }
+            }
+            return Some(out);
+        }
+        let fresh = t.pool.take_finished();
+        if !fresh.is_empty() {
+            t.done.lock().ok()?.extend(fresh);
+            continue;
+        }
+        let mut w = t.wake.0.lock().ok()?;
+        if !w.0 && !w.1 {
+            let (guard, wait) = t.wake.1.wait_timeout(w, std::time::Duration::from_millis(500)).ok()?;
+            w = guard;
+            if wait.timed_out() {
+                quiet += 1;
+                // The render threads let go of their page-sized buffers after 3 s with nothing
+                // to do; then hand that memory back to Android, which the allocator keeps
+                // otherwise.
+                if quiet == 8 {
+                    release_free_memory();
+                }
+            }
+        }
+        if w.1 {
+            return None;
+        }
+        w.0 = false;
+    }
+}
+
+/// Returns memory freed in the Rust core to the system (bionic's `M_PURGE`).
+fn release_free_memory() {
+    #[cfg(target_os = "android")]
+    {
+        unsafe extern "C" {
+            fn mallopt(param: i32, value: i32) -> i32;
+        }
+        const M_PURGE: i32 = -101;
+        // SAFETY: mallopt only reads its two integer arguments.
+        unsafe { mallopt(M_PURGE, 0) };
+    }
 }
 
 type R = Result<Value, String>;
@@ -977,13 +1086,11 @@ fn dispatch(method: &str, a: &Value) -> R {
             })
         }
         "pdf.open" => {
-            let engine = ao3reader::pdf::open(arg_str(a, "id")?)?;
-            let sizes: Vec<Value> = (0..engine.page_count()).map(|p| engine.page_size(p)).map(|s| json!([s.width, s.height])).collect();
-            *PDF.lock().map_err(|_| "pdf poisoned")? = Some(engine);
-            Ok(json!({ "sizes": sizes }))
+            let (doc, sizes) = open_pdf(arg_str(a, "id")?)?;
+            Ok(json!({ "doc": doc, "sizes": sizes }))
         }
         "pdf.close" => {
-            *PDF.lock().map_err(|_| "pdf poisoned")? = None;
+            close_pdf();
             Ok(Value::Null)
         }
         "catalogs" => with_state(|s| Ok(catalogs_json(&s.config))),
@@ -1154,17 +1261,26 @@ fn dispatch(method: &str, a: &Value) -> R {
 
 #[cfg(target_os = "android")]
 mod jni_entry {
-    use jni::objects::{JClass, JString};
-    use jni::sys::{jfloat, jint, jintArray, jstring};
+    use jni::objects::{JClass, JIntArray, JString};
+    use jni::sys::{jint, jintArray, jstring};
     use jni::JNIEnv;
 
-    /// A part of a page of the open PDF as ARGB pixels (null if it can't be drawn).
+    /// The parts of the open PDF's pages the page view wants (see `pdf_want`).
     #[no_mangle]
-    pub extern "system" fn Java_org_ao3reader_Core_renderPdf<'l>(env: JNIEnv<'l>, _class: JClass<'l>, page: jint, scale: jfloat, x: jint, y: jint, w: jint, h: jint, look: jint) -> jintArray {
-        let area = (x.max(0) as u32, y.max(0) as u32, w.max(0) as u32, h.max(0) as u32);
-        let Some(px) = super::render_pdf(page.max(0) as usize, scale, area, look as u8) else { return std::ptr::null_mut() };
-        match env.new_int_array(px.len() as i32) {
-            Ok(arr) if env.set_int_array_region(&arr, 0, &px).is_ok() => arr.into_raw(),
+    pub extern "system" fn Java_org_ao3reader_Core_pdfWant<'l>(env: JNIEnv<'l>, _class: JClass<'l>, doc: jint, look: jint, jobs: JIntArray<'l>) {
+        let n = env.get_array_length(&jobs).unwrap_or(0).max(0) as usize;
+        let mut buf = vec![0; n];
+        if env.get_int_array_region(&jobs, 0, &mut buf).is_ok() {
+            super::pdf_want(doc, look as u8, &buf);
+        }
+    }
+
+    /// The next rendered part of the open PDF (see `pdf_tile`); null once it's closed.
+    #[no_mangle]
+    pub extern "system" fn Java_org_ao3reader_Core_pdfTile<'l>(env: JNIEnv<'l>, _class: JClass<'l>, doc: jint) -> jintArray {
+        let Some(t) = super::pdf_tile(doc) else { return std::ptr::null_mut() };
+        match env.new_int_array(t.len() as i32) {
+            Ok(arr) if env.set_int_array_region(&arr, 0, &t).is_ok() => arr.into_raw(),
             _ => std::ptr::null_mut(),
         }
     }

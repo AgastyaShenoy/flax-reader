@@ -20,11 +20,18 @@ object Core {
     @JvmStatic
     private external fun call(method: String, arg: String): String
 
-    /** Part of a page of the open PDF (see "pdf.open") as ARGB pixels, at `scale` pixels per
-     *  point; `look` 0 is as printed, 1 dark, 2 sepia. Null if it can't be drawn. Slow: call it off
-     *  the UI thread, on a thread with a deep stack. */
+    /** The parts of the open PDF's pages (`doc` from "pdf.open") to render, most important first,
+     *  in place of the ones asked for before: (page, column, row, x, y, width, height, scale as
+     *  float bits) each, the column and row naming the part, x to height in page pixels at the
+     *  scale (pixels per point); `look` 0 is as printed, 1 dark, 2 sepia. Returns at once. */
     @JvmStatic
-    external fun renderPdf(page: Int, scale: Float, x: Int, y: Int, w: Int, h: Int, look: Int): IntArray?
+    external fun pdfWant(doc: Int, look: Int, jobs: IntArray)
+
+    /** Waits for the next rendered part: (page, column, row, look, scale as float bits, width,
+     *  height), then its ARGB pixels (none if the engine failed on it). Null once the PDF is
+     *  closed. Blocks: call it on a thread of its own. */
+    @JvmStatic
+    external fun pdfTile(doc: Int): IntArray?
 
     // A few at once, so a word lookup or a sign-in doesn't wait behind a long download.
     private val worker = Executors.newFixedThreadPool(3)

@@ -4,7 +4,7 @@
 use crate::ao3::models::{Work, WorkMeta};
 use crate::storage::library::LibraryManager;
 pub use pdf_engine::{Engine, PageRenderer, PageSize, PixelRect};
-pub use pdf_render::Look;
+pub use pdf_render::{Done, Job, Look, RenderPool, TileKey};
 use std::sync::Arc;
 
 /// Name of the PDF in the book's folder.

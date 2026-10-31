@@ -1,6 +1,6 @@
 [package]
 name = "ao3reader"
-version = "2.5.1"
+version = "2.5.2"
 license = "GPL-3.0-or-later"
 edition = "2024"
 

@@ -13,8 +13,8 @@ android {
         applicationId = "org.ao3reader"
         minSdk = 26
         targetSdk = 36
-        versionCode = 7
-        versionName = "2.5.1"
+        versionCode = 8
+        versionName = "2.5.2"
     }
 
     buildTypes {
